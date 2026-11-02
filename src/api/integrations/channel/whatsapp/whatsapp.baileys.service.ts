@@ -251,6 +251,7 @@ export class BaileysStartupService extends ChannelStartupService {
   private endSession = false;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
+  private pilotHistorySeenMessageIds = new Set<string>();
 
   // Only one ON_DEMAND request is active at a time, to avoid mixing chat histories.
   private allHistorySyncRunning = false;
@@ -976,103 +977,92 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
-  private async syncAllHistory(): Promise<void> {
+  // Read a bounded sample of already saved messages: no per-chat JSON scan.
+  // At most 3 chats x 2 history pages for the initial pilot.
+  private async syncExistingHistoryPilot(): Promise<void> {
     if (this.allHistorySyncRunning) {
-      this.logger.warn('syncAllHistory is already running');
+      this.logger.warn('historyPilot already running');
       return;
     }
     this.allHistorySyncRunning = true;
+    const maxChats = 3;
+    const maxPagesPerChat = 2;
+    let requested = 0;
+    let returned = 0;
+    let failures = 0;
 
-    let completed = 0;
-    let skipped = 0;
-    let failed = 0;
-    let pages = 0;
     try {
       if (!this.configService.get<Database>('DATABASE').SAVE_DATA.HISTORIC) {
-        throw new Error('Enable DATABASE_SAVE_DATA_HISTORIC before running syncAllHistory');
+        throw new Error('DATABASE_SAVE_DATA_HISTORIC must be true');
       }
 
-      const chats = await this.prismaRepository.chat.findMany({
+      // LIMIT without ORDER BY / JSON filtering prevents the expensive
+      // key->remoteJid search that stalled Supabase in the earlier test.
+      const sample = await this.prismaRepository.message.findMany({
         where: { instanceId: this.instanceId },
-        select: { remoteJid: true },
-        orderBy: { remoteJid: 'asc' },
+        select: { key: true, messageTimestamp: true },
+        take: 400,
       });
-      this.logger.info(`syncAllHistory started: ${chats.length} chats`);
+      const perChat = new Map<string, { key: WAMessageKey; timestampSec: number }>();
 
-      for (const [index, chat] of chats.entries()) {
-        const chatId = chat.remoteJid;
-        if (!/@(s\.whatsapp\.net|lid|g\.us)$/.test(chatId)) {
-          skipped++;
-          continue;
+      for (const row of sample) {
+        const key = row.key as WAMessageKey;
+        const chatId = key?.remoteJid;
+        const seconds = row.messageTimestamp;
+        if (!chatId || !key.id || !Number.isSafeInteger(seconds) || seconds <= 0) continue;
+        if (!/@(s\.whatsapp\.net|lid|g\.us)$/.test(chatId)) continue;
+        this.pilotHistorySeenMessageIds.add(key.id);
+        const current = perChat.get(chatId);
+        if (!current || seconds < current.timestampSec) {
+          perChat.set(chatId, { key, timestampSec: seconds });
         }
+      }
 
-        // Evolution stores message keys in JSON, so search by the actual chat JID.
-        const stored = await this.prismaRepository.message.findFirst({
-          where: { instanceId: this.instanceId, key: { path: ['remoteJid'], equals: chatId } },
-          orderBy: { messageTimestamp: 'asc' },
-          select: { key: true, messageTimestamp: true },
-        });
-        let key = stored?.key as WAMessageKey | undefined;
-        let timestampSec = stored?.messageTimestamp;
-        if (!key?.id || !key.remoteJid || typeof timestampSec !== 'number' ||
-            !Number.isSafeInteger(timestampSec) || timestampSec <= 0) {
-          skipped++;
-          this.logger.warn(`syncAllHistory ${index + 1}/${chats.length}: no usable anchor`);
-          continue;
-        }
+      const anchors = [...perChat.entries()]
+        .sort((a, b) => a[1].timestampSec - b[1].timestampSec)
+        .slice(0, maxChats);
 
-        const seen = new Set<string>();
-        let pageCount = 0;
-        let requestFailed = false;
-        const maxPages = 1000; // Safety limit: up to 50,000 requested messages per chat.
+      this.logger.info(
+        `historyPilot started: sampled=${sample.length}, found=${perChat.size} chats, selected=${anchors.length}, maxPagesPerChat=${maxPagesPerChat}`,
+      );
 
-        while (pageCount < maxPages) {
-          const cursor = `${key.id}:${timestampSec}`;
-          if (seen.has(cursor)) break;
-          seen.add(cursor);
-          try {
-            const batch = await this.fetchHistoryBackfillPage(chatId, key, timestampSec);
-            pages++;
-            pageCount++;
-
-            const older = batch.filter((message) => {
-              const seconds = Number(message.messageTimestamp?.toString());
-              return message.key?.id && Number.isSafeInteger(seconds) && seconds > 0 && seconds < timestampSec;
-            }).sort((a, b) =>
-              Number(a.messageTimestamp?.toString()) - Number(b.messageTimestamp?.toString()),
+      for (const [index, [chatId, anchor]] of anchors.entries()) {
+        let key = anchor.key;
+        let timestampSec = anchor.timestampSec;
+        try {
+          for (let page = 1; page <= maxPagesPerChat; page++) {
+            const olderMessages = await this.fetchHistoryBackfillPage(chatId, key, timestampSec);
+            requested++;
+            returned += olderMessages.length;
+            const validOlder = olderMessages
+              .filter((m) => m.key?.id && Number(m.messageTimestamp?.toString()) > 0 &&
+                Number(m.messageTimestamp?.toString()) < timestampSec)
+              .sort((a, b) => Number(a.messageTimestamp?.toString()) - Number(b.messageTimestamp?.toString()));
+            this.logger.info(
+              `historyPilot progress: chat=${index + 1}/${anchors.length} page=${page} returned=${olderMessages.length} older=${validOlder.length} cursorDate=${new Date(timestampSec * 1000).toISOString().slice(0, 10)}`,
             );
-
-            if (!older.length) break;
-            const oldest = older[0];
+            if (!validOlder.length) break;
+            const oldest = validOlder[0];
             key = oldest.key!;
             timestampSec = Number(oldest.messageTimestamp?.toString());
-
-            // Keep requests sequential and avoid flooding WhatsApp's history service.
-            await new Promise<void>((resolve) => setTimeout(resolve, 1500));
-          } catch (error) {
-            requestFailed = true;
-            this.logger.error(`syncAllHistory failed requesting a page: ${String(error)}`);
-            break;
+            // Sequential pages, with breathing room for WhatsApp and Postgres.
+            await new Promise<void>((resolve) => setTimeout(resolve, 4000));
           }
+        } catch (error) {
+          failures++;
+          this.logger.error(`historyPilot chat ${index + 1} failed: ${String(error)}`);
         }
-
-        if (requestFailed) failed++;
-        else completed++;
-        this.logger.info(
-          `syncAllHistory progress: ${index + 1}/${chats.length} chats; ${pageCount} pages in current chat; ${pages} pages total; ${skipped} skipped; ${failed} failed`,
-        );
       }
       this.logger.info(
-        `syncAllHistory finished: ${completed} processed, ${skipped} without anchor/unsupported, ${failed} failed; ${pages} pages requested`,
+        `historyPilot finished: selected=${anchors.length}, requestedPages=${requested}, receivedMessages=${returned}, failedChats=${failures}`,
       );
     } catch (error) {
-      this.logger.error(`syncAllHistory stopped: ${String(error)}`);
+      this.logger.error(`historyPilot stopped: ${String(error)}`);
     } finally {
       this.historyBackfillWaiter?.finish();
       this.allHistorySyncRunning = false;
     }
   }
-
   private readonly messageHandle = {
     'messaging-history.set': async ({
       messages,
@@ -1147,21 +1137,25 @@ export class BaileysStartupService extends ChannelStartupService {
 
         const messagesRaw: any[] = [];
 
-        const messagesRepository: Set<string> = new Set(
-          chatwootImport.getRepositoryMessagesCache(instance) ??
-            (
-              await this.prismaRepository.message.findMany({
-                select: { key: true },
-                where: { instanceId: this.instanceId },
-              })
-            ).map((message) => {
-              const key = message.key as { id: string };
+        // ON_DEMAND pilot batches must not load every existing message key
+        // into RAM or read the entire Message table on every incoming page.
+        const isOnDemand = syncType === proto.HistorySync.HistorySyncType.ON_DEMAND;
+        const messagesRepository: Set<string> = isOnDemand
+          ? this.pilotHistorySeenMessageIds
+          : new Set(
+              chatwootImport.getRepositoryMessagesCache(instance) ??
+                (
+                  await this.prismaRepository.message.findMany({
+                    select: { key: true },
+                    where: { instanceId: this.instanceId },
+                  })
+                ).map((message) => {
+                  const key = message.key as { id: string };
+                  return key.id;
+                }),
+            );
 
-              return key.id;
-            }),
-        );
-
-        if (chatwootImport.getRepositoryMessagesCache(instance) === null) {
+        if (!isOnDemand && chatwootImport.getRepositoryMessagesCache(instance) === null) {
           chatwootImport.setRepositoryMessagesCache(instance, messagesRepository);
         }
 
@@ -1202,7 +1196,14 @@ export class BaileysStartupService extends ChannelStartupService {
         });
 
         if (this.configService.get<Database>('DATABASE').SAVE_DATA.HISTORIC) {
-          await this.prismaRepository.message.createMany({ data: messagesRaw, skipDuplicates: true });
+          const saved = await this.prismaRepository.message.createMany({ data: messagesRaw, skipDuplicates: true });
+          if (syncType === proto.HistorySync.HistorySyncType.ON_DEMAND) {
+            for (const m of messagesRaw) {
+              const key = m.key as WAMessageKey;
+              if (key?.id) this.pilotHistorySeenMessageIds.add(key.id);
+            }
+            this.logger.info(`historyPilot database batch: stored=${saved.count}`);
+          }
         }
 
         if (syncType === proto.HistorySync.HistorySyncType.ON_DEMAND) {
@@ -1279,8 +1280,14 @@ export class BaileysStartupService extends ChannelStartupService {
               );
               console.log('requested on-demand sync, id=', messageId);
             }
+            if (text === 'syncExistingHistory' || text === 'syncAllHistory') {
+              this.logger.info(`history control received: ${text}, authorized=${isHistoryAdmin}`);
+            }
+            if (text === 'syncExistingHistory' && isHistoryAdmin) {
+              void this.syncExistingHistoryPilot();
+            }
             if (text === 'syncAllHistory' && isHistoryAdmin) {
-              void this.syncAllHistory();
+              this.logger.warn('syncAllHistory disabled until database backfill is optimized; use syncExistingHistory for a bounded pilot');
             }
           }
 
