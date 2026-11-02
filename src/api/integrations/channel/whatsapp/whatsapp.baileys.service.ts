@@ -1063,6 +1063,56 @@ export class BaileysStartupService extends ChannelStartupService {
       this.allHistorySyncRunning = false;
     }
   }
+  // Focused test: a genuine March 2025 message already verified in Supabase.
+  // No table scan or contact message is needed. Only two ON_DEMAND pages.
+  private async syncAnasHistoryPilot(): Promise<void> {
+    if (this.allHistorySyncRunning) {
+      this.logger.warn('anasHistory cannot start: another history pilot is running');
+      return;
+    }
+    this.allHistorySyncRunning = true;
+    const chatId = '213542352633@s.whatsapp.net';
+    let key: WAMessageKey = {
+      remoteJid: chatId,
+      id: '3A2D07D9AEE438916B37',
+      fromMe: false,
+    };
+    // 2025-03-01 09:22:00 UTC, expressed as seconds; Baileys gets ms.
+    let timestampSec = 1740820920;
+    let pagesRequested = 0;
+    let messagesReceived = 0;
+
+    try {
+      if (!this.configService.get<Database>('DATABASE').SAVE_DATA.HISTORIC) {
+        throw new Error('DATABASE_SAVE_DATA_HISTORIC must be true');
+      }
+      this.logger.info(`anasHistory started: anchor=2025-03-01, maxPages=2, chat=${chatId}`);
+      for (let page = 1; page <= 2; page++) {
+        this.logger.info(`anasHistory requesting page=${page}, anchorId=${key.id}, cursorDate=${new Date(timestampSec * 1000).toISOString()}`);
+        const batch = await this.fetchHistoryBackfillPage(chatId, key, timestampSec);
+        pagesRequested++;
+        messagesReceived += batch.length;
+        const older = batch.filter((message) => {
+          const seconds = Number(message.messageTimestamp?.toString());
+          return !!message.key?.id && Number.isSafeInteger(seconds) && seconds > 0 && seconds < timestampSec;
+        }).sort((a, b) =>
+          Number(a.messageTimestamp?.toString()) - Number(b.messageTimestamp?.toString()),
+        );
+        this.logger.info(`anasHistory result: page=${page}, received=${batch.length}, older=${older.length}`);
+        if (!older.length) break;
+        key = older[0].key!;
+        timestampSec = Number(older[0].messageTimestamp?.toString());
+        this.logger.info(`anasHistory oldest: ${new Date(timestampSec * 1000).toISOString()}`);
+        if (page < 2) await new Promise<void>((resolve) => setTimeout(resolve, 4000));
+      }
+      this.logger.info(`anasHistory finished: requestedPages=${pagesRequested}, receivedMessages=${messagesReceived}`);
+    } catch (error) {
+      this.logger.error(`anasHistory failed: ${String(error)}`);
+    } finally {
+      this.historyBackfillWaiter?.finish();
+      this.allHistorySyncRunning = false;
+    }
+  }
   private readonly messageHandle = {
     'messaging-history.set': async ({
       messages,
@@ -1280,11 +1330,14 @@ export class BaileysStartupService extends ChannelStartupService {
               );
               console.log('requested on-demand sync, id=', messageId);
             }
-            if (text === 'syncExistingHistory' || text === 'syncAllHistory') {
+            if (text === 'syncExistingHistory' || text === 'syncAllHistory' || text === 'syncAnasHistory') {
               this.logger.info(`history control received: ${text}, authorized=${isHistoryAdmin}`);
             }
             if (text === 'syncExistingHistory' && isHistoryAdmin) {
               void this.syncExistingHistoryPilot();
+            }
+            if (text === 'syncAnasHistory' && isHistoryAdmin) {
+              void this.syncAnasHistoryPilot();
             }
             if (text === 'syncAllHistory' && isHistoryAdmin) {
               this.logger.warn('syncAllHistory disabled until database backfill is optimized; use syncExistingHistory for a bounded pilot');
